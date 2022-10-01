@@ -1,0 +1,9 @@
+# IDEs
+.idea/
+.vscode/
+*.code-workspace
+
+# build
+/target/
+/userGuide/book
+/Cargo.lock
