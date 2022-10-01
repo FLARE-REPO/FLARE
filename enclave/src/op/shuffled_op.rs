@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 use std::hash::Hash;
 
-use deepsize::DeepSizeOf;
-
+use crate::CNT_PER_PARTITION;
 use crate::aggregator::Aggregator;
 use crate::dependency::ShuffleDependency;
 use crate::op::*;
@@ -81,116 +80,77 @@ where
     }
 
     pub fn compute_inner(&self, tid: u64, input: Input) -> Vec<ItemE> {
-        fn merge_core<K: Ord + Data, V: Data, C: Data>(buckets: Vec<Vec<(K, C)>>, aggregator: &Arc<Aggregator<K, V, C>>) -> Vec<(K, C)> {
-            let mut iter = buckets.into_iter().kmerge_by(|a, b| a.0 < b.0);
-            let mut combiners = match iter.next() {
-                Some(first) => vec![first],
-                None => vec![],
-            };
-    
-            for (k, c) in iter {
-                if k == combiners.last().unwrap().0 {
-                    let pair = combiners.last_mut().unwrap();
-                    pair.1 = (aggregator.merge_combiners)((std::mem::take(&mut pair.1), c));
-                } else {
-                    combiners.push((k, c));
+        let data_enc = input.get_enc_data::<Vec<ItemE>>();
+        let mut res = create_enc();
+        let aggregator = self.aggregator.clone(); 
+        if aggregator.is_default {
+            //group by is not obliviously implemented
+            let mut sub_part_kc: Vec<(Option<K>, C)> = Vec::new();
+            for sub_part in data_enc {
+                let sub_part: Vec<(Option<K>, V)> = ser_decrypt(&sub_part.clone());
+                for (j, group) in sub_part.group_by(|x, y| x.0 == y.0).enumerate() {
+                    let k = group[0].0.clone(); //the type is consistent with aggregate
+                    let mut iter = group.iter();
+                    let init_v = iter.next().unwrap().1.clone();
+                    let c = iter.fold((aggregator.create_combiner)(init_v), |acc, v| (aggregator.merge_value)((acc, v.1.clone())));
+                    if j == 0 && !sub_part_kc.is_empty() {
+                        let (lk, lc) = sub_part_kc.last_mut().unwrap();
+                        if *lk == k {
+                            *lc = (aggregator.merge_combiners)((std::mem::take(lc), c));
+                        } else {
+                            sub_part_kc.push((k, c));
+                        }
+                    } else {
+                        sub_part_kc.push((k, c));
+                    }
+                };
+                let last = sub_part_kc.pop().unwrap();
+                if !sub_part_kc.is_empty() {
+                    let res_bl = ser_encrypt(&sub_part_kc);
+                    merge_enc(&mut res, &res_bl);
                 }
+                sub_part_kc = vec![last];
             }
-            combiners
-        }
-        
-        let mut acc = create_enc();
-        let data_enc = input.get_enc_data::<Vec<Vec<Vec<ItemE>>>>();
-        assert_eq!(data_enc.len(), MAX_THREAD + 1);
-        let (is_para_enc, is_para_mer) = {
-            crate::ALLOCATOR.reset_alloc_cnt();
-            let sample_data = data_enc[0].iter().map(|bucket_enc| batch_decrypt::<(K, C)>(bucket_enc, true)).collect::<Vec<_>>();
-            let sample_len = sample_data.iter().map(|v| v.len()).sum::<usize>();
-            let alloc_cnt = crate::ALLOCATOR.get_alloc_cnt();
-            let alloc_cnt_ratio = (alloc_cnt as f64)/(sample_len as f64);
-            let is_para_enc = alloc_cnt_ratio < PARA_THRESHOLD;
-            println!("for decryption, alloc_cnt per len = {:?}", alloc_cnt_ratio);
-
-            crate::ALLOCATOR.reset_alloc_cnt();
-            let combiners = merge_core(sample_data, &self.aggregator);
-            let alloc_cnt = crate::ALLOCATOR.get_alloc_cnt();
-            let alloc_cnt_ratio = (alloc_cnt as f64)/(sample_len as f64);
-            let is_para_merge = alloc_cnt_ratio < PARA_THRESHOLD;
-            println!("for merge, alloc_cnt per len = {:?}", alloc_cnt_ratio);
-            combine_enc(&mut acc, batch_encrypt(&combiners, true));
-            (is_para_enc, is_para_merge)
-        };
-
-        let mut handlers = Vec::with_capacity(MAX_THREAD);
-        if !is_para_enc {
-            let mut data = data_enc[1..MAX_THREAD+1].iter().map(|buckets_enc| {
-                buckets_enc.iter().map(|bucket_enc| batch_decrypt::<(K, C)>(bucket_enc, true)).collect::<Vec<_>>()
-            }).collect::<Vec<_>>();
-            if !is_para_mer {
-                let mut combiners = data.into_iter().map(|buckets| merge_core(buckets, &self.aggregator)).collect::<Vec<_>>();
-                for i in 0..MAX_THREAD {
-                    let combiners = combiners.pop().unwrap();
-                    let builder = thread::Builder::new();
-                    let handler = builder
-                        .spawn(move || {
-                            batch_encrypt(&combiners, true)
-                        }).unwrap();
-                    handlers.push(handler);
-                }
-            } else {
-                for i in 0..MAX_THREAD {
-                    let aggregator = self.aggregator.clone();
-                    let buckets = data.pop().unwrap();
-                    let builder = thread::Builder::new();
-                    let handler = builder
-                        .spawn(move || {
-                            let combiners = merge_core(buckets, &aggregator);
-                            batch_encrypt(&combiners, true)
-                        }).unwrap();
-                    handlers.push(handler);
-                }
+            if !sub_part_kc.is_empty() {
+                let res_bl = ser_encrypt(&sub_part_kc);
+                merge_enc(&mut res, &res_bl);
             }
         } else {
-            if !is_para_mer {
-                let mut handlers_pt = Vec::with_capacity(MAX_THREAD);
-                for i in 1..MAX_THREAD + 1 {
-                    let handler = thread::Builder::new()
-                        .spawn(move || {
-                            let buckets_enc = input.get_enc_data::<Vec<Vec<Vec<ItemE>>>>();
-                            buckets_enc[i].iter().map(|bucket_enc| batch_decrypt::<(K, C)>(bucket_enc, true)).collect::<Vec<_>>()
-                        }).unwrap();
-                    handlers_pt.push(handler);
+            //assume others are min, max, avg, add, etc.
+            //they can be implemented obliviously
+            let mut last_k = None;
+            let mut last_c = Default::default();
+            let mut last_kc: Option<(Option<K>, C)> = None;
+            for sub_part in data_enc {
+                let sub_part: Vec<(Option<K>, V)> = ser_decrypt(&sub_part.clone());
+                let mut sub_part_kc: Vec<(Option<K>, C)> = Vec::with_capacity(sub_part.len());
+                if let Some(last_kc) = last_kc {
+                    sub_part_kc.push(last_kc);
                 }
-                for handler in handlers_pt {
-                    let aggregator = self.aggregator.clone();
-                    let buckets = handler.join().unwrap();
-                    let combiners = merge_core(buckets, &aggregator);
-                    let handler = thread::Builder::new()
-                        .spawn(move || {
-                            batch_encrypt(&combiners, true)
-                        }).unwrap();
-                    handlers.push(handler);
+                for (k, v) in sub_part {
+                    if last_k == k {
+                        last_c = (aggregator.merge_value)((last_c, v));
+                        if let Some(last_kc) = sub_part_kc.last_mut() {
+                            last_kc.0 = None;
+                        }
+                    } else {
+                        last_k = k.clone();
+                        last_c = (aggregator.create_combiner)(v);
+                    }
+                    sub_part_kc.push((k, last_c.clone()));
                 }
-            } else {
-                for i in 1..MAX_THREAD + 1 {
-                    let aggregator = self.aggregator.clone();
-                    let handler = thread::Builder::new()
-                        .spawn(move || {
-                            let buckets_enc = input.get_enc_data::<Vec<Vec<Vec<ItemE>>>>();
-                            let buckets = buckets_enc[i].iter().map(|bucket_enc| batch_decrypt::<(K, C)>(bucket_enc, true)).collect::<Vec<_>>();
-                            let combiners = merge_core(buckets, &aggregator);
-                            batch_encrypt(&combiners, true)
-                        }).unwrap();
-                    handlers.push(handler);
+                last_kc = sub_part_kc.pop();
+                if !sub_part_kc.is_empty() {
+                    let res_bl = ser_encrypt(&sub_part_kc);
+                    merge_enc(&mut res, &res_bl);
                 }
             }
+            if last_kc.is_some() {
+                let res_bl = ser_encrypt(&vec![last_kc.unwrap()]);
+                merge_enc(&mut res, &res_bl);
+            }
         }
-
-        for handler in handlers {
-            combine_enc(&mut acc, handler.join().unwrap());
-        }
-
-        acc
+        res
     }
 }
 
@@ -221,6 +181,21 @@ where
                 let shuf_dep = self.get_next_shuf_dep(dep_info).unwrap();
                 shuf_dep.free_res_enc(res_ptr, is_enc);
             },
+            20 => {
+                unreachable!();
+            }
+            21 | 22 | 23 | 25 | 26 | 27 | 28 => {
+                crate::ALLOCATOR.set_switch(true);
+                let res = unsafe { Box::from_raw(res_ptr as *mut Vec<Vec<ItemE>>) };
+                drop(res);
+                crate::ALLOCATOR.set_switch(false);
+            },
+            24 => {
+                crate::ALLOCATOR.set_switch(true);
+                let res = unsafe { Box::from_raw(res_ptr as *mut Vec<ItemE>) };
+                drop(res);
+                crate::ALLOCATOR.set_switch(false);
+            }
             _ => panic!("invalid is_shuffle"),
         }
     }
@@ -318,6 +293,60 @@ where
             2 => {
                 let result = self.compute_inner(call_seq.tid, input);
                 to_ptr(result)
+            }
+            20 => {
+                let mut num_real_elem = 0;
+                let data_enc = input.get_enc_data::<Vec<Vec<ItemE>>>();
+                for part in data_enc {
+                    for sub_part in part {
+                        let sub_part: Vec<(Option<K>, V)> = ser_decrypt(&sub_part.clone());
+                        num_real_elem += sub_part.len();
+                    }
+                }
+                assert!(CNT_PER_PARTITION.lock().unwrap().insert((self.get_op_id(), call_seq.get_part_id()), num_real_elem).is_none());
+                0 as *mut u8
+            }
+            21 | 22 | 23 => {
+                combined_column_sort_step_4_6_8::<K, V>(call_seq.tid, input, dep_info, self.get_op_id(), call_seq.get_part_id(), self.number_of_splits())
+            },
+            24 => { //aggregate again with the agg info from other servers
+                let ser = call_seq.get_ser_captured_var().unwrap();
+                let mut sup_data: Vec<(Option<K>, C)> = batch_decrypt(ser, false);
+                assert_eq!(sup_data.len(), 1);
+                let mut last_kc = sup_data.remove(0);
+                let agg_data_ref = input.get_enc_data::<Vec<ItemE>>();
+                let mut res = create_enc();
+                let aggregator = self.aggregator.clone(); 
+
+                for sub_part_enc in agg_data_ref {
+                    let mut sub_part: Vec<(Option<K>, C)> = vec![last_kc];
+                    sub_part.append(&mut ser_decrypt(&sub_part_enc.clone()));
+                    for j in 1..sub_part.len() {
+                        if sub_part[j].0.is_none() {
+                            sub_part.swap(j-1, j);
+                        } else if sub_part[j].0 == sub_part[j-1].0 {
+                            sub_part[j].1 = (aggregator.merge_combiners)((std::mem::take(&mut sub_part[j-1].1), std::mem::take(&mut sub_part[j].1)));
+                            sub_part[j-1].0 = None;
+                        }
+                    }
+                    last_kc = sub_part.pop().unwrap();
+                    if !sub_part.is_empty() {
+                        let res_bl = ser_encrypt(&sub_part);
+                        merge_enc(&mut res, &res_bl);
+                    }
+                }
+                // the last one will be transmit to other servers
+                let sub_part = vec![last_kc];
+                let res_bl = ser_encrypt(&sub_part);
+                merge_enc(&mut res, &res_bl);
+                
+                to_ptr(res)
+            }
+            25 => {
+                combined_column_sort_step_2::<K, C>(call_seq.tid, input, self.get_op_id(), call_seq.get_part_id(), self.number_of_splits())
+            }
+            26 | 27 | 28 => {
+                combined_column_sort_step_4_6_8::<K, C>(call_seq.tid, input, dep_info, self.get_op_id(), call_seq.get_part_id(), self.number_of_splits())
             }
             _ => panic!("Invalid is_shuffle"),
         }

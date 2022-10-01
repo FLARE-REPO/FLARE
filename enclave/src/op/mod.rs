@@ -1,3 +1,4 @@
+use core::marker::PhantomData;
 use core::panic::Location;
 use std::any::{Any, TypeId};
 use std::boxed::Box;
@@ -19,10 +20,11 @@ use std::vec::Vec;
 
 use aes_gcm::Aes128Gcm;
 use aes_gcm::aead::{Aead, NewAead, generic_array::GenericArray};
+use deepsize::DeepSizeOf;
 use sgx_types::*;
 use rand::{Rng, SeedableRng};
 
-use crate::{CACHE, Fn, OP_MAP};
+use crate::{CACHE, Fn, OP_MAP, CNT_PER_PARTITION};
 use crate::basic::{AnyData, Arc as SerArc, Data, Func, SerFunc};
 use crate::custom_thread::PThread;
 use crate::dependency::{Dependency, OneToOneDependency, ShuffleDependencyTrait};
@@ -216,6 +218,447 @@ fn get_text_loc_id() -> u64 {
     id
 }
 
+// prepare for column step 2, shuffle (transpose)
+pub fn column_sort_step_2<T>(tid: u64, sorted_data: Vec<T>, max_len: usize, num_output_splits: usize) -> Vec<Vec<ItemE>>
+where
+    T: Data
+{
+    let mut buckets_enc = create_enc();
+
+    let mut i = 0;
+    let mut buckets = vec![Vec::with_capacity(sorted_data.len().saturating_sub(1) / num_output_splits + 1); num_output_splits];
+
+    for kc in sorted_data {
+        buckets[i % num_output_splits].push(kc);
+        i += 1;
+    }
+
+    for bucket in buckets {
+        let bucket_enc = batch_encrypt(&bucket, true);
+        crate::ALLOCATOR.set_switch(true);
+        buckets_enc.push(bucket_enc);
+        crate::ALLOCATOR.set_switch(false);
+    }
+    buckets_enc
+}
+
+pub fn column_sort_step_4_6_8<T>(tid: u64, sorted_data: Vec<T>, cnt_per_partition: usize, max_len: usize, n: usize, num_output_splits: usize) -> Vec<Vec<ItemE>>
+where
+    T: Data
+{
+    let chunk_size = cnt_per_partition.saturating_sub(1) / num_output_splits + 1;
+
+    crate::ALLOCATOR.set_switch(true);
+    let mut buckets_enc = vec![Vec::new(); num_output_splits];
+    crate::ALLOCATOR.set_switch(false);
+
+    for (i, bucket) in sorted_data.chunks(chunk_size).enumerate() {
+        let bucket_enc = batch_encrypt(bucket, true);
+        crate::ALLOCATOR.set_switch(true);
+        buckets_enc[i] = bucket_enc;
+        crate::ALLOCATOR.set_switch(false);
+    }
+    buckets_enc
+}
+
+pub fn combined_column_sort_step_2<K, V>(tid: u64, input: Input, op_id: OpId, part_id: usize, num_output_splits: usize) -> *mut u8
+where
+    K: Data + Ord,
+    V: Data
+{
+    let data_enc = input.get_enc_data::<Vec<ItemE>>();
+
+    let mut data = Vec::new();
+    let mut max_len = 0;
+
+    let mut sub_part: Vec<(Option<K>, V)> = Vec::new();
+    for block_enc in data_enc {
+        sub_part.append(&mut ser_decrypt(&block_enc.clone()));
+        if sub_part.deep_size_of() > CACHE_LIMIT/input.get_parallel() {
+            sub_part.sort_unstable_by(cmp_f);
+            max_len = std::cmp::max(max_len, sub_part.len());
+            data.push(sub_part);
+            sub_part = Vec::new();
+        }
+    }
+    if !sub_part.is_empty() {
+        sub_part.sort_unstable_by(cmp_f);
+        max_len = std::cmp::max(max_len, sub_part.len());
+        data.push(sub_part);
+    }
+
+    if max_len == 0 {
+        assert!(CNT_PER_PARTITION.lock().unwrap().insert((op_id, part_id), 0).is_none());
+        //although the type is incorrect, it is ok because it is empty.
+        crate::ALLOCATOR.set_switch(true);
+        let buckets_enc: Vec<Vec<ItemE>> = Vec::new();
+        crate::ALLOCATOR.set_switch(false);
+        to_ptr(buckets_enc)
+    } else {
+        let mut sort_helper = SortHelper::<K, V>::new(data, max_len, true);
+        sort_helper.sort();
+        let (sorted_data, num_real_elem) = sort_helper.take();
+        assert!(CNT_PER_PARTITION.lock().unwrap().insert((op_id, part_id), num_real_elem).is_none());
+        let buckets_enc = column_sort_step_2::<(Option<K>, V)>(tid, sorted_data, max_len, num_output_splits);
+        to_ptr(buckets_enc)
+    }
+}
+
+pub fn combined_column_sort_step_4_6_8<K, V>(tid: u64, input: Input, dep_info: &DepInfo, op_id: OpId, part_id: usize, num_output_splits: usize) -> *mut u8
+where
+    K: Data + Ord,
+    V: Data
+{
+    let data_enc_ref = input.get_enc_data::<Vec<Vec<ItemE>>>();
+    let mut max_len = 0;
+
+    let mut data = Vec::with_capacity(data_enc_ref.len());
+    for part_enc in data_enc_ref {
+        let mut part = Vec::new();
+        let mut sub_part: Vec<(Option<K>, V)> = Vec::new();
+        for block_enc in part_enc.iter() {
+            //we can derive max_len from the first sub partition in each partition
+            sub_part.append(&mut ser_decrypt(&block_enc.clone()));
+            if sub_part.deep_size_of() > CACHE_LIMIT/input.get_parallel() {
+                max_len = std::cmp::max(max_len, sub_part.len());
+                part.push(sub_part);
+                sub_part = Vec::new();
+            }
+        }
+        if !sub_part.is_empty() {
+            max_len = std::cmp::max(max_len, sub_part.len());
+            part.push(sub_part);
+        }
+        data.push(part);
+    }
+    if max_len == 0 {
+        if dep_info.dep_type() == 23 || dep_info.dep_type() == 28 {
+            CNT_PER_PARTITION.lock().unwrap().remove(&(op_id, part_id)).unwrap();
+        }
+        res_enc_to_ptr(Vec::<Vec<ItemE>>::new())
+    } else {
+        let mut sort_helper = SortHelper::<K, V>::new_with(data, max_len, true);
+        sort_helper.sort();
+        let (sorted_data, num_real_elem) = sort_helper.take();
+        let cnt_per_partition = *CNT_PER_PARTITION.lock().unwrap().get(&(op_id, part_id)).unwrap();
+        let buckets_enc = match dep_info.dep_type() {
+            21 | 26 => column_sort_step_4_6_8::<(Option<K>, V)>(tid, sorted_data, cnt_per_partition, max_len, num_real_elem, num_output_splits),
+            22 | 27 => column_sort_step_4_6_8::<(Option<K>, V)>(tid, sorted_data, cnt_per_partition, max_len, num_real_elem, 2),
+            23 => {
+                CNT_PER_PARTITION.lock().unwrap().remove(&(op_id, part_id)).unwrap();
+                column_sort_step_4_6_8::<(Option<K>, V)>(tid, sorted_data, cnt_per_partition, max_len, num_real_elem, 2)
+            },
+            28 => {
+                CNT_PER_PARTITION.lock().unwrap().remove(&(op_id, part_id)).unwrap();
+                let sorted_data = sorted_data.into_iter()
+                    .filter(|(k, c)| k.is_some())
+                    .map(|(k, c)| (k.unwrap(), c))
+                    .collect::<Vec<_>>();
+                column_sort_step_4_6_8::<(K, V)>(tid, sorted_data, cnt_per_partition, max_len, num_real_elem, 2)
+            }
+            _ => unreachable!(),
+        };
+        to_ptr(buckets_enc)
+    }
+}
+
+pub fn cmp_f<K, V>(a: &(Option<K>, V), b: &(Option<K>, V)) -> Ordering 
+where 
+    K: Data + Ord,
+    V: Data
+{
+    //TODO: need to be a doubly-oblivious implementation
+    if a.0.is_some() && b.0.is_some() {
+        a.0.cmp(&b.0)
+    } else {
+        a.0.cmp(&b.0).reverse()
+    }
+}
+
+//require each vec (ItemE) is sorted
+pub struct SortHelper<K, V>
+where
+    K: Data + Ord,
+    V: Data,
+{
+    data: Vec<Arc<Mutex<Vec<(Option<K>, V)>>>>,
+    max_len: usize,
+    num_padding: Arc<AtomicUsize>,
+    ascending: bool,
+    dist: Option<Vec<usize>>,
+    dist_use_map: Option<HashMap<usize, AtomicBool>>,
+}
+
+impl<K, V> SortHelper<K, V>
+where
+    K: Data + Ord,
+    V: Data,
+{
+    pub fn new(data: Vec<Vec<(Option<K>, V)>>, max_len: usize, ascending: bool) -> Self {
+        let data = {
+            data
+                .into_iter()
+                .map(|x| Arc::new(Mutex::new(x)))
+                .collect::<Vec<_>>()
+        };
+        SortHelper { data, max_len, num_padding: Arc::new(AtomicUsize::new(0)), ascending, dist: None, dist_use_map: None}
+    }
+
+    //optimize for merging sorted arrays
+    pub fn new_with(data: Vec<Vec<Vec<(Option<K>, V)>>>, max_len: usize, ascending: bool) -> Self {
+        let dist = Some(vec![0].into_iter().chain(data.iter()
+            .map(|p| p.len()))
+            .scan(0usize, |acc, x| {
+                *acc = *acc + x;
+                Some(*acc)
+            }).collect::<Vec<_>>());
+        // true means the array is sorted originally, never touched in the following algorithm
+        let dist_use_map = dist.as_ref().map(|dist| dist.iter().map(|k| (*k, AtomicBool::new(true))).collect::<HashMap<_, _>>());
+        let data = {
+            data.into_iter().map(|p| p.into_iter().map(|x|Arc::new(Mutex::new(x)))).flatten().collect::<Vec<_>>()
+        };
+        SortHelper { data, max_len, num_padding: Arc::new(AtomicUsize::new(0)), ascending, dist, dist_use_map}
+    }
+
+    pub fn sort(&self) {
+        let n = self.data.len();
+        self.bitonic_sort_arbitrary(0, n, self.ascending);
+    }
+
+    fn bitonic_sort_arbitrary(&self, lo: usize, n: usize, dir: bool) {
+        if n > 1 {
+            match &self.dist {
+                Some(dist) => {
+                    let r_idx = dist.binary_search(&(lo+n)).unwrap();
+                    let l_idx = dist.binary_search(&lo).unwrap();
+                    if r_idx - l_idx > 1 {
+                        let m = dist[(l_idx + r_idx)/2] - lo;
+                        self.bitonic_sort_arbitrary(lo, m, !dir);
+                        self.bitonic_sort_arbitrary(lo + m, n - m, dir);
+                    }
+                    self.bitonic_merge_arbitrary(lo, n, dir);
+                },
+                None => {
+                    let m = n / 2;
+                    self.bitonic_sort_arbitrary(lo, m, !dir);
+                    self.bitonic_sort_arbitrary(lo + m, n - m, dir);
+                    self.bitonic_merge_arbitrary(lo, n, dir);
+                }
+            };
+        }
+    }
+
+    fn bitonic_merge_arbitrary(&self, lo: usize, n: usize, dir: bool) {
+        fn is_inconsistent_dir<K: Data + Ord, V: Data>(d: &Vec<(Option<K>, V)>, dir: bool) -> bool {
+            d
+                .first()
+                .zip(d.last())
+                .map(|(x, y)| cmp_f(x, y).is_lt() != dir)
+                .unwrap_or(false)
+        }
+        
+        if n > 1 {
+            let max_len = self.max_len;
+            let num_padding = self.num_padding.clone();
+
+            let mut is_sorted = self.dist.as_ref().map_or(false, |dist| {
+                dist.binary_search(&(lo + n)).map_or(false, |idx| 
+                    dist[idx - 1] == lo 
+                )
+            });
+            is_sorted = is_sorted && self.dist_use_map.as_ref().map_or(false, |dist_use_map| {
+                dist_use_map.get(&(lo+n)).unwrap().fetch_and(false, atomic::Ordering::SeqCst)
+            });
+            if is_sorted {
+                let mut first_d = None;
+                let mut last_d = None;
+                for i in lo..(lo + n) {
+                    if let Some(x) = self.data[i].lock().unwrap().first() {
+                        first_d = Some(x.clone());
+                        break;
+                    }
+                }
+                for i in (lo..(lo + n)).rev() {
+                    if let Some(x) = self.data[i].lock().unwrap().last() {
+                        last_d = Some(x.clone());
+                        break;
+                    }
+                }
+
+                let (ori_dir, should_reverse) = first_d.as_ref()
+                    .zip(last_d.as_ref())
+                    .map(|(x, y)| {
+                        let ori_dir = cmp_f(x, y).is_lt();
+                        (ori_dir, ori_dir != dir)
+                    }).unwrap_or((true, false));
+
+                //originally ascending
+                if ori_dir {
+                    let mut d_i: Vec<(Option<K>, V)> = Vec::new();
+                    let mut cnt = lo;
+                    for i in lo..(lo + n) {
+                        d_i.append(&mut *self.data[i].lock().unwrap());
+                        if d_i.len() >= max_len {
+                            let mut r = d_i.split_off(max_len);
+                            std::mem::swap(&mut r, &mut d_i);
+                            if should_reverse {
+                                r.reverse();
+                            }
+                            *self.data[cnt].lock().unwrap() = r;
+                            cnt += 1;
+                        }
+                    }
+                    let mut add_num_padding = 0;
+                    while cnt < lo + n {
+                        add_num_padding += max_len - d_i.len();
+                        d_i.resize(max_len, (None, Default::default()));
+                        if should_reverse {
+                            d_i.reverse();
+                        }
+                        *self.data[cnt].lock().unwrap() = d_i;
+                        d_i = Vec::new();
+                        cnt += 1;
+                    }
+                    num_padding.fetch_add(add_num_padding, atomic::Ordering::SeqCst);
+                } else {  //originally desending
+                    let mut d_i: Vec<(Option<K>, V)> = vec![Default::default(); max_len];
+                    let mut cur_len = 0;
+                    let mut cnt = lo + n - 1;
+                    for i in (lo..(lo + n)).rev() {
+                        let v = &mut *self.data[i].lock().unwrap();
+                        let v_len = v.len();
+                        if v_len < max_len - cur_len {
+                            (&mut d_i[max_len-cur_len-v_len..max_len-cur_len]).clone_from_slice(v);
+                            cur_len += v_len;
+                        } else {
+                            let r = v.split_off(v_len - (max_len - cur_len));
+                            (&mut d_i[..max_len-cur_len]).clone_from_slice(&r);
+                            if should_reverse {
+                                d_i.reverse();
+                            }
+                            *self.data[cnt].lock().unwrap() = d_i;
+                            cnt = cnt.wrapping_sub(1);
+                            cur_len = v.len();
+                            d_i = vec![Default::default(); max_len];
+                            (&mut d_i[max_len-cur_len..max_len]).clone_from_slice(v);
+                        }
+                    }
+                    let mut add_num_padding = 0;
+                    while cnt >= lo && cnt != usize::MAX { 
+                        add_num_padding += max_len - cur_len;
+                        for elem in &mut d_i[..max_len-cur_len] {
+                            elem.0 = None;
+                            elem.1 = Default::default();
+                        }
+                        if should_reverse {
+                            d_i.reverse();
+                        }
+                        *self.data[cnt].lock().unwrap() = d_i;
+                        cnt = cnt.wrapping_sub(1);
+                        cur_len = 0;
+                        d_i = vec![Default::default(); max_len];
+                    }
+                    num_padding.fetch_add(add_num_padding, atomic::Ordering::SeqCst);
+                }
+                if should_reverse {
+                    for i in lo..(lo + n / 2) {
+                        let l = 2 * lo + n - 1 - i;
+                        std::mem::swap(&mut *self.data[i].lock().unwrap(), &mut *self.data[l].lock().unwrap());
+                    }
+                }
+            } else {
+                let m = n.next_power_of_two() >> 1;
+                for i in lo..(lo + n - m) {
+                    let l = i + m;
+                    //merge
+                    let d_i: Vec<(Option<K>, V)> = std::mem::take(&mut *self.data[i].lock().unwrap());
+                    let d_l: Vec<(Option<K>, V)> = std::mem::take(&mut *self.data[l].lock().unwrap());
+    
+                    let real_len = d_i.len() + d_l.len();
+                    let dummy_len = max_len * 2 - real_len;
+                    if real_len < max_len * 2 {
+                        num_padding.fetch_add(dummy_len, atomic::Ordering::SeqCst);
+                    }
+    
+                    let mut new_d_i = Vec::with_capacity(max_len);
+                    let mut new_d_l = Vec::with_capacity(max_len);
+                    //desending, append dummy elements first
+                    if !dir {
+                        new_d_i.append(&mut vec![(None, Default::default()); std::cmp::min(dummy_len, max_len)]);
+                        new_d_l.append(&mut vec![(None, Default::default()); dummy_len.saturating_sub(max_len)]);
+                    }
+    
+                    let mut iter_i = if is_inconsistent_dir(&d_i, dir) {
+                        Box::new(d_i.into_iter().rev()) as Box<dyn Iterator<Item = (Option<K>, V)>>
+                    } else {
+                        Box::new(d_i.into_iter()) as Box<dyn Iterator<Item = (Option<K>, V)>>
+                    };
+    
+                    let mut iter_l = if is_inconsistent_dir(&d_l, dir) {
+                        Box::new(d_l.into_iter().rev()) as Box<dyn Iterator<Item = (Option<K>, V)>>
+                    } else {
+                        Box::new(d_l.into_iter()) as Box<dyn Iterator<Item = (Option<K>, V)>>
+                    };
+    
+                    let mut cur_i = iter_i.next();
+                    let mut cur_l = iter_l.next();
+    
+                    while cur_i.is_some() || cur_l.is_some() {
+                        let should_puti = cur_l.is_none()
+                            || cur_i.is_some()
+                                &&  cmp_f(cur_i.as_ref().unwrap(), cur_l.as_ref().unwrap()).is_lt() == dir;
+                        let kv = if should_puti {
+                            let t = cur_i.unwrap();
+                            cur_i = iter_i.next();
+                            t
+                        } else {
+                            let t = cur_l.unwrap();
+                            cur_l = iter_l.next();
+                            t
+                        };
+    
+                        if new_d_i.len() < max_len {
+                            new_d_i.push(kv);
+                        } else {
+                            new_d_l.push(kv);
+                        }
+                    }
+    
+                    //ascending, append dummy elements finally
+                    if dir {
+                        new_d_i.resize(max_len, (None, Default::default()));
+                        new_d_l.resize(max_len, (None, Default::default()));
+                    }
+
+                    *self.data[i].lock().unwrap() = new_d_i;
+                    *self.data[l].lock().unwrap() = new_d_l;
+                }
+    
+                self.bitonic_merge_arbitrary(lo, m, dir);
+                self.bitonic_merge_arbitrary(lo + m, n - m, dir);
+            }
+        }
+    }
+
+    pub fn take(&mut self) -> (Vec<(Option<K>, V)>, usize) {
+        let num_padding = self.num_padding.load(atomic::Ordering::SeqCst);
+        let num_real_elem = self.data.len() * self.max_len - num_padding;
+        let num_real_sub_part = self.data.len() - num_padding / self.max_len;
+        let num_padding_remaining = num_real_sub_part * self.max_len - num_real_elem;
+
+        let mut data = std::mem::take(&mut self.data);
+        //remove dummy elements
+        data.truncate(num_real_sub_part);
+        if let Some(last) = data.last_mut() {
+            let mut last = last.lock().unwrap();
+            assert!(last.get(self.max_len - num_padding_remaining).map_or(true, |x| x.0.is_none()));
+            last.truncate(self.max_len - num_padding_remaining);
+        }
+        let res = data.into_iter().flat_map(|x| Arc::try_unwrap(x).unwrap().into_inner().unwrap()).collect::<Vec<_>>();
+        (res, num_real_elem)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheMeta {
@@ -310,7 +753,8 @@ impl DepInfo {
         self.identifier
     }
 
-    /// 0 for narrow, 1 for shuffle write, 2 for shuffle read, 3 for action
+    /// 0 for narrow, 1 for shuffle write, 2 for shuffle read, 3, 4 for action
+    /// 20-23, 25-28 for first/second column sort, 24 for aggregate again
     pub fn dep_type(&self) -> u8 {
         self.is_shuffle
     }
@@ -1105,7 +1549,7 @@ pub trait Op: OpBase + 'static {
             //another version of parallel_control, there are no decryption step
             match std::mem::take(&mut call_seq.para_range) {
                 Some((b, e)) => {
-                    let r = e.saturating_sub(b);
+                    let r = e - b;
                     if r == 0 {
                         Box::new(vec![].into_iter()) 
                     } else {
@@ -1128,7 +1572,7 @@ pub trait Op: OpBase + 'static {
                         let cache_space = self.get_cache_space();
                         let mut cache_space = cache_space.lock().unwrap();
                         let entry = cache_space.get_mut(&key).unwrap();
-                        call_seq.para_range = Some((0, entry.len().saturating_sub(1)));
+                        call_seq.para_range = Some((0, entry.len() - 1));
                         entry.pop().unwrap()
                     };
                     call_seq.sample_len = sample_data.len();
@@ -1231,11 +1675,7 @@ pub trait Op: OpBase + 'static {
     fn parallel_control(&self, call_seq: &mut NextOpId, data_enc: &Vec<ItemE>) -> ResIter<Self::Item> {
         match std::mem::take(&mut call_seq.para_range) {
             Some((b, e)) => {
-                let mut data = if let Some(data_enc) = data_enc.get(b..e) {
-                    data_enc.iter().map(|x| ser_decrypt::<Vec<Self::Item>>(&x.clone())).collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+                let mut data = data_enc[b..e].iter().map(|x| ser_decrypt::<Vec<Self::Item>>(&x.clone())).collect::<Vec<_>>();
                 if call_seq.is_step_para.0 ^ call_seq.is_step_para.1 {
                     
                     let key = (call_seq.get_cur_rdd_id(), call_seq.get_part_id());
@@ -1259,11 +1699,7 @@ pub trait Op: OpBase + 'static {
             None => {
                 //for profile
                 crate::ALLOCATOR.reset_alloc_cnt();
-                let data = if data_enc.is_empty() {
-                    Vec::new()
-                } else {
-                    ser_decrypt::<Vec<Self::Item>>(&data_enc[0].clone())
-                };
+                let data = ser_decrypt::<Vec<Self::Item>>(&data_enc[0].clone());
                 let alloc_cnt = crate::ALLOCATOR.get_alloc_cnt();
                 call_seq.sample_len = data.len();
                 let alloc_cnt_ratio = alloc_cnt as f64/(call_seq.sample_len as f64);
@@ -1300,7 +1736,7 @@ pub trait Op: OpBase + 'static {
 
     fn spawn_dec_nar_thread(&self, call_seq: &NextOpId, input: Input, handlers: &mut Vec<JoinHandle<Vec<Vec<Self::Item>>>>, only_dec: bool) {
         let (s, len) = call_seq.para_range.as_ref().unwrap();
-        let r = (len.saturating_sub(*s)).saturating_sub(1) / MAX_THREAD + 1;
+        let r = (len - s).saturating_sub(1) / MAX_THREAD + 1;
         let mut b = *s;
         let mut e = std::cmp::min(b + r, *len);
         for _ in 0..MAX_THREAD {
@@ -1325,7 +1761,7 @@ pub trait Op: OpBase + 'static {
 
     fn spawn_dec_nar_enc_thread(&self, call_seq: &NextOpId, input: Input, handlers: &mut Vec<JoinHandle<Vec<ItemE>>>, only_dec: bool) {
         let (s, len) = call_seq.para_range.as_ref().unwrap();
-        let r = (len.saturating_sub(*s)).saturating_sub(1) / MAX_THREAD + 1;
+        let r = (len - s).saturating_sub(1) / MAX_THREAD + 1;
         let mut b = *s;
         let mut e = std::cmp::min(b + r, *len);
         for _ in 0..MAX_THREAD {

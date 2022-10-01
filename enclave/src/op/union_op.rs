@@ -234,11 +234,15 @@ impl<T: Data> Op for Union<T>
             return self.get_and_remove_cached_data(call_seq);
         }
         
-        let opb = call_seq.get_next_op().clone();
-        let op = opb.to_arc_op::<dyn Op<Item = T>>().unwrap();
-        let res_iter = op.compute(call_seq, input);
+        let res_iter = if call_seq.is_head() {
+            let data_enc = input.get_enc_data::<Vec<ItemE>>();
+            self.parallel_control(call_seq, data_enc)
+        } else {
+            let opb = call_seq.get_next_op().clone();
+            let op = opb.to_arc_op::<dyn Op<Item = T>>().unwrap();
+            op.compute(call_seq, input)
+        };
 
-        let key = call_seq.get_caching_doublet();
         if need_cache {
             return self.set_cached_data(
                 call_seq,

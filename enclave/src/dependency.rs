@@ -158,7 +158,6 @@ where
             child,
         }
     }
-
 }
 
 impl<K, V, C> ShuffleDependencyTrait for ShuffleDependency<K, V, C>
@@ -177,10 +176,12 @@ where
 
     fn do_shuffle_task(&self, tid: u64, opb: Arc<dyn OpBase>, call_seq: NextOpId, input: Input) -> *mut u8 {
         let op = opb.to_arc_op::<dyn Op<Item = (K, V)>>().unwrap();
-        let mut sub_parts: Vec<Vec<(K, V)>> = Vec::new();
+
+        let mut sub_parts: Vec<Vec<(Option<K>, V)>> = Vec::new();
         let mut sub_part_size = 0;
         let results = *unsafe{ Box::from_raw(op.narrow(call_seq, input, false) as *mut Vec<Vec<(K, V)>>) };
-        for mut block in results {
+        for block in results {
+            let mut block = block.into_iter().map(|(k, v)| (Some(k), v)).collect::<Vec<_>>();
             let block_size = block.deep_size_of();
             let mut should_create_new = true;
             if let Some(sub_part) = sub_parts.last_mut() {
@@ -202,81 +203,41 @@ where
             let mut sub_parts = sub_parts.split_off(sub_parts.len().saturating_sub(r));
             let handler = thread::Builder::new()
                 .spawn(move || {
+                    let mut local_max_len = 0;
                     for sub_part in sub_parts.iter_mut() {
                         sub_part.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                        local_max_len = std::cmp::max(local_max_len, sub_part.len()); 
                     }
-                    sub_parts
+                    (sub_parts, local_max_len)
                 }).unwrap();
             handlers.push(handler);
         }
         assert!(sub_parts.is_empty());
 
-        let aggregator = self.aggregator.clone();
-        let mut partitioner = self.partitioner.read().unwrap().clone();
-        let mut num_output_splits = partitioner.get_num_of_partitions();
-        num_output_splits *= MAX_THREAD + 1;
-        partitioner.set_num_of_partitions(num_output_splits);
+        let mut max_len = 0;
+        let sub_parts = handlers.into_iter().map(|handler| {
+            let (res, len) = handler.join().unwrap();
+            max_len = std::cmp::max(max_len, len);
+            res.into_iter()
+        }).flatten().collect::<Vec<_>>();
 
-        let mut is_para_shuf = true;
-        let mut handlers_res = Vec::with_capacity(MAX_THREAD);
-        for (i, handler) in handlers.into_iter().enumerate() {
-            let mut buckets_col = Vec::new();
-            let mut sub_parts = handler.join().unwrap();
-            if i == 0 {
-                //sample
-                let sample_data = sub_parts.pop().unwrap();
-                let sample_len = sample_data.len();
-                //shuffle specific
-                crate::ALLOCATOR.reset_alloc_cnt();
-                buckets_col.push(do_shuffle_task_core(sample_data, &aggregator, &partitioner, num_output_splits));
-                let alloc_cnt = crate::ALLOCATOR.get_alloc_cnt();
-                let alloc_cnt_ratio = alloc_cnt as f64/(sample_len as f64);
-                println!("for shuffle processing, alloc_cnt per len = {:?}", alloc_cnt_ratio);
-                is_para_shuf = alloc_cnt_ratio < PARA_THRESHOLD;
-            };
-            if is_para_shuf {
-                //launch enc
-                let aggregator = aggregator.clone();
-                let partitioner = partitioner.clone();
-                let handler = thread::Builder::new()
-                    .spawn(move || {
-                        let mut acc = create_enc();
-                        if let Some(buckets) = buckets_col.pop() {
-                            let buckets_enc = buckets.into_iter().map(|bucket| batch_encrypt(&bucket, false)).collect::<Vec<_>>();
-                            merge_enc(&mut acc, &buckets_enc);
-                        }
-                        for sub_part in sub_parts {
-                            let buckets = do_shuffle_task_core(sub_part, &aggregator, &partitioner, num_output_splits);
-                            let buckets_enc = buckets.into_iter().map(|bucket| batch_encrypt(&bucket, false)).collect::<Vec<_>>();
-                            merge_enc(&mut acc, &buckets_enc);
-                        }
-                        acc
-                    }).unwrap();
-                handlers_res.push(handler);
-            } else {
-                for sub_part in sub_parts {
-                    buckets_col.push(do_shuffle_task_core(sub_part, &aggregator, &partitioner, num_output_splits));
-                }
-                //launch enc
-                let handler = thread::Builder::new()
-                    .spawn(move || {
-                        //acc stays outside enclave
-                        let mut acc = create_enc();
-                        for buckets in buckets_col {
-                            let buckets_enc = buckets.into_iter().map(|bucket| batch_encrypt(&bucket, false)).collect::<Vec<_>>();
-                            merge_enc(&mut acc, &buckets_enc);
-                        }
-                        acc
-                    }).unwrap();
-                handlers_res.push(handler);
+        //partition sort (local sort), and pad so that each sub partition should have the same number of (K, V)
+        let mut sort_helper = SortHelper::<K, V>::new(sub_parts, max_len, true);
+        sort_helper.sort();
+        let (sorted_data, num_real_elem) = sort_helper.take();
+        let num_output_splits = self.partitioner.read().unwrap().get_num_of_partitions();
+        let chunk_size = num_real_elem.saturating_sub(1) / num_output_splits + 1;
+        let buckets_enc = if self.is_cogroup {
+            let mut buckets_enc = create_enc();
+            for bucket in sorted_data.chunks(chunk_size) {
+                merge_enc(&mut buckets_enc, &batch_encrypt(bucket, false));
             }
-        }
-
-        let mut acc = create_enc();
-        for handler in handlers_res {
-            combine_enc(&mut acc, handler.join().unwrap());
-        }
-        to_ptr(acc)
+            buckets_enc
+        } else {
+            //TODO: 
+            column_sort_step_2::<(Option<K>, V)>(tid, sorted_data, max_len, num_output_splits)
+        };
+        to_ptr(buckets_enc)
     }
 
     fn send_sketch(&self, buf: &mut SizeBuf, p_data_enc: *mut u8){
@@ -297,7 +258,7 @@ where
     fn free_res_enc(&self, res_ptr: *mut u8, is_enc: bool) {
         assert!(is_enc);
         crate::ALLOCATOR.set_switch(true);
-        let res = unsafe { Box::from_raw(res_ptr as *mut Vec<Vec<Vec<ItemE>>>) };
+        let res = unsafe { Box::from_raw(res_ptr as *mut Vec<Vec<ItemE>>) };
         drop(res);
         crate::ALLOCATOR.set_switch(false);
     }
@@ -323,54 +284,5 @@ where
             parent_op_id,
             child_op_id,
         )) as Arc<dyn ShuffleDependencyTrait>
-    }
-
-}
-
-pub fn do_shuffle_task_core<K, V, C>(mut data: Vec<(K, V)>, aggregator: &Arc<Aggregator<K, V, C>>, partitioner: &Box<dyn Partitioner>, num_output_splits: usize) -> Vec<Vec<(K, C)>>
-where 
-    K: Ord + Data,
-    V: Data,
-    C: Data,
-{
-    if aggregator.is_default {
-        let mut buckets: Vec<Vec<(K, Vec<V>)>> = (0..num_output_splits)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        let mut iter = data.into_iter();
-        if let Some((k, v)) = iter.next() {
-            let mut bucket_id = partitioner.get_partition(&k);
-            buckets[bucket_id].push((k, vec![v]));
-            let mut last_k = &buckets[bucket_id][0].0;
-            for (k, v) in iter {
-                if last_k == &k {
-                    drop(last_k);
-                    buckets[bucket_id].last_mut().unwrap().1.push(v);
-                    last_k = &buckets[bucket_id].last().unwrap().0;
-                } else {
-                    drop(last_k);
-                    bucket_id = partitioner.get_partition(&k);
-                    buckets[bucket_id].push((k, vec![v]));
-                    last_k = &buckets[bucket_id].last().unwrap().0;
-                }
-            }
-        }
-        *(Box::new(buckets) as Box<dyn Any>).downcast::<Vec<Vec<(K, C)>>>().unwrap()
-    } else {
-        let mut buckets: Vec<Vec<(K, C)>> = (0..num_output_splits)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
-        for (k, v) in data.into_iter() {
-            let bucket_id = partitioner.get_partition(&k);
-            let bucket = &mut buckets[bucket_id];
-            if bucket.last().map_or(false, |(last_k, _)| &k == last_k) {
-                let old_v = &mut bucket.last_mut().unwrap().1;
-                let input = ((std::mem::take(old_v), v),);
-                *old_v = aggregator.merge_value.call(input);
-            } else {
-                bucket.push((k, aggregator.create_combiner.call((v,))));
-            }
-        }
-        buckets
     }
 }

@@ -1,9 +1,0 @@
-.git
-
-# IDEs
-.idea/
-.vscode/
-*.code-workspace
-
-# build
-/target/
