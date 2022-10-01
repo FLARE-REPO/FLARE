@@ -1,0 +1,73 @@
+[package]
+name = "sparkenclave"
+version = "1.0.0"
+authors = ["Xiang Li <Xiang.Leee@outlook.com>"]
+edition = "2018"
+
+[lib]
+name = "sparkenclave"
+crate-type = ["staticlib"]
+
+[features]
+default = []
+
+[target.'cfg(not(target_env = "sgx"))'.dependencies]
+sgx_alloc = { path = "../incubator-teaclave-sgx-sdk/sgx_alloc" }
+sgx_libc = { path = "../incubator-teaclave-sgx-sdk/sgx_libc" }
+sgx_serialize = { path = "../incubator-teaclave-sgx-sdk/sgx_serialize" }
+sgx_signal = { path = "../incubator-teaclave-sgx-sdk/sgx_signal" }
+sgx_tcrypto = { path = "../incubator-teaclave-sgx-sdk/sgx_tcrypto" }
+sgx_trts = { path = "../incubator-teaclave-sgx-sdk/sgx_trts" }
+sgx_tseal = { path = "../incubator-teaclave-sgx-sdk/sgx_tseal" }
+sgx_tstd = { path = "../incubator-teaclave-sgx-sdk/sgx_tstd", features = ["thread"] }
+sgx_types = { path = "../incubator-teaclave-sgx-sdk/sgx_types" }
+
+[dependencies]
+aes-gcm = "0.8.0"
+bincode = { git = "https://github.com/mesalock-linux/bincode-sgx" }
+# bytes = { git = "https://github.com/mesalock-linux/bytes-sgx" }
+# dashmap = { version = "3.11.10", features = ["no_std"] }  # need to port
+deepsize = { version = "0.2.0", default-features = false, features = ["derive"] }
+downcast-rs = { version = "1.2.0", default-features = false }
+dyn-clone = "1.0.3"
+itertools = { git = "https://github.com/mesalock-linux/rust-itertools-sgx" }
+lazy_static = { version = "1.4.0", features = ["spin_no_std"] }
+# typetag = { git = "https://github.com/mesalock-linux/typetag-sgx" }
+serde = { git = "https://github.com/mesalock-linux/serde-sgx" }
+serde_derive = { git = "https://github.com/mesalock-linux/serde-sgx" }
+serde_closure = { git = "https://github.com/AmbitionXiang/serde_closure", branch = "sgx" }
+#serde_closure = { path = "../../../sgx/ported/serde_closure" }
+spin = "0.7.0"
+rand = { git = "https://github.com/mesalock-linux/rand-sgx/" }
+rand_distr = { git = "https://github.com/mesalock-linux/rand-sgx/" }
+rand_pcg = { git = "https://github.com/mesalock-linux/rand-sgx/" }
+
+[patch.'https://github.com/apache/teaclave-sgx-sdk.git']
+sgx_alloc = { path = "../incubator-teaclave-sgx-sdk/sgx_alloc" }
+sgx_backtrace = { path = "../incubator-teaclave-sgx-sdk/sgx_backtrace" }
+sgx_backtrace_sys = { path = "../incubator-teaclave-sgx-sdk/sgx_backtrace_sys" }
+sgx_build_helper = { path = "../incubator-teaclave-sgx-sdk/sgx_build_helper" }
+sgx_cov = { path = "../incubator-teaclave-sgx-sdk/sgx_cov" }
+sgx_crypto_helper = { path = "../incubator-teaclave-sgx-sdk/sgx_crypto_helper" }
+sgx_libc = { path = "../incubator-teaclave-sgx-sdk/sgx_libc" }
+sgx_demangle = { path = "../incubator-teaclave-sgx-sdk/sgx_demangle" }
+sgx_rand = { path = "../incubator-teaclave-sgx-sdk/sgx_rand" }
+sgx_rand_derive = { path = "../incubator-teaclave-sgx-sdk/sgx_rand_derive" }
+sgx_serialize = { path = "../incubator-teaclave-sgx-sdk/sgx_serialize" }
+sgx_serialize_derive = { path = "../incubator-teaclave-sgx-sdk/sgx_serialize_derive" }
+sgx_serialize_derive_internals = { path = "../incubator-teaclave-sgx-sdk/sgx_serialize_derive_internals" }
+sgx_signal = { path = "../incubator-teaclave-sgx-sdk/sgx_signal" }
+sgx_tcrypto = { path = "../incubator-teaclave-sgx-sdk/sgx_tcrypto" }
+sgx_tcrypto_helper = { path = "../incubator-teaclave-sgx-sdk/sgx_tcrypto_helper" }
+sgx_tdh = { path = "../incubator-teaclave-sgx-sdk/sgx_tdh" }
+sgx_tkey_exchange = { path = "../incubator-teaclave-sgx-sdk/sgx_tkey_exchange" }
+sgx_tprotected_fs = { path = "../incubator-teaclave-sgx-sdk/sgx_tprotected_fs" }
+sgx_trts = { path = "../incubator-teaclave-sgx-sdk/sgx_trts" }
+sgx_tse = { path = "../incubator-teaclave-sgx-sdk/sgx_tse" }
+sgx_tseal = { path = "../incubator-teaclave-sgx-sdk/sgx_tseal" }
+sgx_tstd = { path = "../incubator-teaclave-sgx-sdk/sgx_tstd" }
+sgx_tunittest = { path = "../incubator-teaclave-sgx-sdk/sgx_tunittest" }
+sgx_types = { path = "../incubator-teaclave-sgx-sdk/sgx_types" }
+sgx_ucrypto = { path = "../incubator-teaclave-sgx-sdk/sgx_ucrypto" }
+sgx_unwind = { path = "../incubator-teaclave-sgx-sdk/sgx_unwind" }
+sgx_urts = { path = "../incubator-teaclave-sgx-sdk/sgx_urts" }

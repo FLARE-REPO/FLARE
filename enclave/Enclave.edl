@@ -1,0 +1,110 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+enclave {
+    from "sgx_tstd.edl" import *;
+    from "sgx_stdio.edl" import *;
+    from "sgx_backtrace.edl" import *;
+    from "sgx_tstdc.edl" import *;
+    from "sgx_pthread.edl" import *;
+    from "sgx_sys.edl" import *;
+    from "sgx_thread.edl" import *;
+    
+    struct op_id_t {
+        uint64_t h;
+    };
+
+    struct cache_meta_t {
+        size_t caching_rdd_id;
+        struct op_id_t caching_op_id;
+        size_t caching_part_id;
+        size_t cached_rdd_id;
+        struct op_id_t cached_op_id;
+        size_t cached_part_id;
+    };
+
+    struct dep_info_t {
+        uint8_t is_shuffle;
+        size_t identifier;
+        size_t parent_rdd_id;
+        size_t child_rdd_id;
+        struct op_id_t parent_op_id;
+        struct op_id_t child_op_id;
+    };
+
+    struct input_t {
+        size_t data;
+        size_t parallel_num;
+    };
+    
+    trusted {
+        /* define ECALLs here. */
+        public void secure_execute_pre(uint64_t tid,
+            [user_check] uint8_t* op_ids,
+            [user_check] uint8_t* part_nums,
+            struct dep_info_t dep_info);
+        public size_t secure_execute(uint64_t tid,
+            [user_check] uint8_t* rdd_ids,
+            [user_check] uint8_t* op_ids,
+            [user_check] uint8_t* part_ids,
+            struct cache_meta_t cache_meta,
+            struct dep_info_t dep_info, 
+		    struct input_t input, 
+		    [user_check] uint8_t* captured_vars);
+        public void free_res_enc(struct op_id_t op_id,
+            struct dep_info_t dep_info,
+		    [user_check] uint8_t* input);
+        void priv_free_res_enc(struct op_id_t op_id,
+            struct dep_info_t dep_info,
+		    [user_check] uint8_t* input);
+        public void get_sketch(struct op_id_t op_id,
+            struct dep_info_t dep_info,
+            [user_check] uint8_t* p_buf,
+            [user_check] uint8_t* p_data_enc);
+        public void clone_out(struct op_id_t op_id,
+            struct dep_info_t dep_info,
+            size_t p_out,
+            [user_check] uint8_t* p_data_enc);
+        public size_t randomize_in_place(struct op_id_t op_id,
+            [user_check] uint8_t* input,
+            uint64_t seed,
+            uint8_t is_some,
+            uint64_t num);
+        public void set_sampler(struct op_id_t op_id,
+            uint8_t with_replacement,
+            double fraction);
+        public size_t etake(struct op_id_t op_id,
+            [user_check] uint8_t* input,
+            size_t should_take,
+            [user_check] size_t* have_take);
+        public size_t tail_compute([user_check] uint8_t* input);
+        public void free_tail_info([user_check] uint8_t* input);
+        public void clear_cache();
+        public size_t pre_touching(uint8_t zero);
+    };
+
+    untrusted {
+        uint8_t ocall_cache_to_outside(size_t rdd_id,
+            size_t part_id,
+            size_t data_ptr)
+            allow(priv_free_res_enc); 
+        size_t ocall_cache_from_outside(size_t rdd_id,
+            size_t part_id);
+        void* sbrk_o(size_t size);  
+    };
+
+};
